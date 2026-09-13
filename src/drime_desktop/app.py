@@ -17,7 +17,7 @@ from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 from . import APP_ID, __version__, backend, updates  # noqa: E402
 from .web import DrimeWebView, open_externally  # noqa: E402
 
-WINDOW_STATE = backend.HOME / ".config/drime-desktop/window.json"
+WINDOW_STATE = backend.CONFIG_DIR / "window.json"
 
 
 def run_async(fn: Callable, on_done: Callable[[object, Exception | None], None]) -> None:
@@ -138,7 +138,9 @@ class SettingsDialog(Adw.PreferencesDialog):
         g = Adw.PreferencesGroup(title="Remove")
         self.page.add(g)
         row = Adw.ActionRow(title="Remove my setup",
-                            subtitle="Unmounts the drive, stops syncing and signs out of the web app. "
+                            subtitle="Unmounts the drive, stops "
+                                     + ("the background service" if backend.is_flatpak() else "syncing")
+                                     + " and signs out of the web app. "
                                      f"{backend.SYNC_DIR.name} and your cloud data are kept.")
         row.add_prefix(Gtk.Image.new_from_icon_name("user-trash-symbolic"))
         row.add_suffix(button("Remove…", self.confirm_remove, "destructive-action"))
@@ -155,8 +157,12 @@ class SettingsDialog(Adw.PreferencesDialog):
             self._known = st
             if self.drive_row.get_active() != st.mount_enabled:
                 self.drive_row.set_active(st.mount_enabled)
+            service_down = st.daemon_alive is False   # Flatpak: the background service is not running
+            self.drive_row.set_sensitive(not st.drive_problem)
             self.drive_row.set_subtitle(
-                f"{backend.MOUNT} — " + ("mounted" if st.mounted else
+                f"{backend.MOUNT} — " + (f"not available: {st.drive_problem}" if st.drive_problem else
+                                        "mounted" if st.mounted else
+                                        "background service not running" if st.mount_enabled and service_down else
                                         "starting…" if st.mount_active else
                                         "enabled, not mounted" if st.mount_enabled else "off"))
             if self.sync_row.get_active() != st.sync_enabled:
@@ -165,6 +171,8 @@ class SettingsDialog(Adw.PreferencesDialog):
                 sub = "syncing now…"
             elif not st.sync_enabled:
                 sub = "off"
+            elif service_down:
+                sub = "background service not running"
             else:
                 last = "never synced" if not ss.last_end else \
                     f"last sync {relative_time(ss.last_end)} ({'ok' if ss.last_result == 'success' else 'failed'})"
@@ -252,6 +260,14 @@ class SettingsDialog(Adw.PreferencesDialog):
                 self.update_spinner.stop()
                 self.update_install_btn.set_sensitive(True)
                 self.toast(str(err))
+                return
+            if backend.is_flatpak():
+                # No PackageKit in the sandbox: hand the bundle to the host's software center.
+                self.update_spinner.stop()
+                self.update_install_btn.set_visible(False)
+                updates.open_for_install(path)
+                self.update_row.set_subtitle(f"Downloaded {path.name} to {path.parent.name} — install it in the "
+                                             "window that opened, then reopen Drime")
                 return
             self.update_row.set_subtitle(f"Installing {rel.version}… (authorise when asked)")
             def pct(n):
@@ -355,7 +371,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._tick_id = GLib.timeout_add_seconds(10, self._tick)
         if notice:
             self.toast(notice)
-        self._startup_migration()
+        self._startup_housekeeping()
         GLib.timeout_add_seconds(5, lambda: (self._startup_update_check(), False)[1])
         self.connect("close-request", self._on_close)
 
@@ -409,7 +425,9 @@ class MainWindow(Adw.ApplicationWindow):
                               license_type=Gtk.License.MIT_X11,
                               comments="Unofficial Drime cloud integration for Linux: virtual drive, "
                                        "sync folder and the Drime web app in one window.\n\n"
-                                       "Not affiliated with Drime. The Drime logo belongs to Drime.")
+                                       "Not affiliated with Drime. The Drime logo belongs to Drime."
+                                       + ("\n\nFlatpak build: the drive and the sync run in Drime's own "
+                                          "background service." if backend.is_flatpak() else ""))
         dlg.present(self)
 
     # --- state -------------------------------------------------------------
@@ -420,12 +438,14 @@ class MainWindow(Adw.ApplicationWindow):
     def _tick(self) -> bool:
         self.refresh()
         self.check_upgraded_on_disk()
+        if backend.is_flatpak():
+            run_async(backend.watchdog, lambda *_: None)   # respawn the background service if it died
         return True
 
     def check_upgraded_on_disk(self) -> None:
         """A package upgrade replaced our files while we run: offer a restart (once)."""
-        if self._restart_offered or self._boot_version is None:
-            return
+        if self._restart_offered or self._boot_version is None or backend.is_flatpak():
+            return   # a Flatpak update deploys to a new directory; this instance keeps its files
         now = updates.installed_version()
         if now is None or now == self._boot_version:
             return
@@ -487,11 +507,14 @@ class MainWindow(Adw.ApplicationWindow):
             self.status_btn.remove_css_class(cls)
         self.status_btn.add_css_class("warning" if warn else "success")
 
-    def _startup_migration(self):
+    def _startup_housekeeping(self):
         def done(result, _err):
             if result:
                 self.toast("Switched to the packaged systemd units")
         def work():
+            if backend.is_flatpak():
+                backend.watchdog()
+                return False
             migrated = backend.migrate_user_units()
             backend.cleanup_legacy()
             return migrated
@@ -507,7 +530,8 @@ class MainWindow(Adw.ApplicationWindow):
             self.settings.offer_release(rel)
             dlg = Adw.AlertDialog.new(f"Drime Desktop {rel.version} is available",
                                       f"You have version {__version__}. Download and install it now? "
-                                      "You will be asked for your password.")
+                                      + ("It will be handed to your software center to install."
+                                         if backend.is_flatpak() else "You will be asked for your password."))
             dlg.add_response("later", "Later")
             dlg.add_response("skip", "Skip this version")
             if rel.package_url:
@@ -537,7 +561,8 @@ class MainWindow(Adw.ApplicationWindow):
         Gio.AppInfo.launch_default_for_uri(f"file://{backend.MOUNT}", None)
 
     def sync_now(self):
-        backend.sync_now()
+        # Off the main thread: in the Flatpak this may have to (re)start the background service.
+        run_async(backend.sync_now, lambda _r, err: self.toast(f"Error: {err}") if err else None)
         self.toast("Sync started")
         GLib.timeout_add_seconds(2, lambda: (self.refresh(), False)[1])
 

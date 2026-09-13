@@ -12,6 +12,7 @@ ASSETS = [
     {"name": "drime-desktop-0.4.0-1.fc44.src.rpm", "browser_download_url": "https://x/srpm"},
     {"name": "drime-desktop_0.4.0_all.deb", "browser_download_url": "https://x/deb"},
     {"name": "drime-desktop-0.4.0.tar.gz", "browser_download_url": "https://x/tar"},
+    {"name": "drime-desktop-0.4.0.flatpak", "browser_download_url": "https://x/flatpak"},
 ]
 
 
@@ -42,6 +43,12 @@ def test_fetch_latest_picks_the_asset_for_the_distro(github_release, fake_distro
     assert rel.version == "0.4.0"
     assert rel.package_url == url
     assert rel.html_url == "https://x/release"
+
+
+def test_fetch_latest_picks_the_flatpak_bundle_in_a_flatpak(github_release, fake_flatpak, fake_distro):
+    fake_distro("fedora")   # the host distro must not matter
+    assert updates.package_family() == "flatpak"
+    assert updates.fetch_latest().package_url == "https://x/flatpak"
 
 
 def test_version_key_orders_numerically():
@@ -76,4 +83,5 @@ def test_is_newer_with_apt(monkeypatch):
 def test_package_suffixes_match_the_release_filenames():
     assert ASSETS[0]["name"].endswith(updates.PACKAGE_SUFFIX["fedora"])
     assert ASSETS[2]["name"].endswith(updates.PACKAGE_SUFFIX["debian"])
+    assert ASSETS[4]["name"].endswith(updates.PACKAGE_SUFFIX["flatpak"])
     assert not ASSETS[1]["name"].endswith(updates.PACKAGE_SUFFIX["fedora"])  # not the src.rpm

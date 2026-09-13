@@ -1,4 +1,5 @@
-"""Update check against GitHub Releases, download and install through PackageKit."""
+"""Update check against GitHub Releases, download and install through PackageKit
+(in the Flatpak: download the .flatpak bundle and open it with the software center)."""
 from __future__ import annotations
 
 import json
@@ -17,9 +18,14 @@ from . import GITHUB_REPO, __version__, backend
 
 API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
-PREFS = Path.home() / ".config/drime-desktop/updates.json"
-# Release asset to download per distribution family (see backend.distro()).
-PACKAGE_SUFFIX = {"fedora": ".noarch.rpm", "debian": "_all.deb"}
+PREFS = backend.CONFIG_DIR / "updates.json"
+# Release asset to download per package family (see package_family()).
+PACKAGE_SUFFIX = {"fedora": ".noarch.rpm", "debian": "_all.deb", "flatpak": ".flatpak"}
+
+
+def package_family() -> str:
+    """Which release asset fits this installation: 'flatpak', or the distribution family."""
+    return "flatpak" if backend.is_flatpak() else backend.distro()
 
 
 class UpdateError(Exception):
@@ -51,7 +57,7 @@ def fetch_latest() -> Release | None:
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         raise UpdateError("Could not reach GitHub. Are you online?") from e
     version = data.get("tag_name", "").lstrip("v")
-    suffix = PACKAGE_SUFFIX.get(backend.distro())
+    suffix = PACKAGE_SUFFIX.get(package_family())
     asset = next((a for a in data.get("assets", []) if suffix and a["name"].endswith(suffix)), None)
     return Release(version, asset["browser_download_url"] if asset else None, data.get("html_url", RELEASES_URL))
 
@@ -74,9 +80,23 @@ def is_newer(latest: str, installed: str) -> bool:
         return _version_key(latest) > _version_key(installed)
 
 
+def downloads_dir() -> Path:
+    try:
+        from gi.repository import GLib
+        d = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD)
+        if d:
+            return Path(d)
+    except (ImportError, ValueError):
+        pass
+    try:
+        out = subprocess.run(["xdg-user-dir", "DOWNLOAD"], capture_output=True, text=True).stdout.strip()
+    except OSError:
+        out = ""
+    return Path(out) if out else Path.home() / "Downloads"
+
+
 def download_package(url: str, progress: Callable[[int, int], None] | None = None) -> Path:
-    dest_dir = Path(subprocess.run(["xdg-user-dir", "DOWNLOAD"], capture_output=True,
-                                   text=True).stdout.strip() or (Path.home() / "Downloads"))
+    dest_dir = downloads_dir()
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / url.rsplit("/", 1)[-1]
     req = urllib.request.Request(url, headers={"User-Agent": f"drime-desktop/{__version__}"})
@@ -99,7 +119,11 @@ def install_package(path: Path, progress: Callable[[int], None] | None = None) -
 
     Runs in a worker thread: the PackageKit call is synchronous. Raises UpdateError
     with a readable message when the user cancels the authorisation or the
-    transaction fails."""
+    transaction fails. In the Flatpak there is no PackageKit: the bundle is handed
+    to the host's software center instead."""
+    if backend.is_flatpak():
+        open_for_install(path)
+        return
     try:
         import gi
         gi.require_version("PackageKitGlib", "1.0")

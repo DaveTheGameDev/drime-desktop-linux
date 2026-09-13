@@ -41,3 +41,25 @@ def test_changelog_starts_with_current_version():
     text = (ROOT / "drime-desktop.spec").read_text()
     first = re.search(r"^\* .* - (\S+)-\d+$", text[text.index("%changelog"):], re.M).group(1)
     assert first == spec_version()
+
+
+def test_flatpak_build_script_stamps_the_version(tmp_path):
+    """What the Flatpak build does: flatpak/build-app.sh installs into a prefix."""
+    prefix = tmp_path / "app"
+    subprocess.run(["sh", "flatpak/build-app.sh", str(prefix)], cwd=ROOT, check=True)
+    out = subprocess.run(
+        [str(prefix / "bin/drime-desktop"), "--version"],
+        env={"PYTHONPATH": str(prefix / "lib/drime-desktop"), "PATH": "/usr/bin:/bin"},
+        capture_output=True, text=True, check=True)
+    assert out.stdout.split() == ["drime-desktop", spec_version()]
+    app_id = "io.github.davethegamedev.DrimeDesktop"
+    desktop = (prefix / f"share/applications/{app_id}.desktop").read_text()
+    assert f"Icon={app_id}\n" in desktop
+    icons = prefix / "share/icons/hicolor/512x512/apps"
+    assert (icons / f"{app_id}.png").is_file() and (icons / "drime-desktop.png").is_file()
+    assert (prefix / f"share/metainfo/{app_id}.metainfo.xml").is_file()
+
+
+def test_metainfo_release_matches_the_version():
+    text = (ROOT / "assets/io.github.davethegamedev.DrimeDesktop.metainfo.xml").read_text()
+    assert re.search(r'<release version="([^"]+)"', text).group(1) == spec_version()

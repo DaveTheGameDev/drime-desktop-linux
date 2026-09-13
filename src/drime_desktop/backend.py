@@ -2,9 +2,14 @@
 
 Pure Python + subprocess. No GTK imports, so it is usable from the CLI, the
 GUI, and tests. Every function is idempotent where it makes sense.
+
+Inside a Flatpak (is_flatpak()) there is no systemd and no in-sandbox FUSE:
+the unit-facing functions talk to the app's own background service instead
+(see sandbox.py / daemon.py), and rclone mounts through the host's fusermount3.
 """
 from __future__ import annotations
 
+import functools
 import glob
 import json
 import os
@@ -12,11 +17,29 @@ import re
 import shutil
 import signal
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+from . import APP_ID
+
 HOME = Path.home()
+
+
+def _xdg(var: str, default: str) -> Path:
+    """An XDG base directory. Plain ~/.config etc. on RPM/DEB; inside a Flatpak
+    the variables point at ~/.var/app/<id>/{config,data,cache} (rclone honours
+    them too, so rclone.conf and its caches land there as well)."""
+    return Path(os.environ.get(var) or HOME / default)
+
+
+CONFIG_HOME = _xdg("XDG_CONFIG_HOME", ".config")
+DATA_HOME = _xdg("XDG_DATA_HOME", ".local/share")
+CACHE_HOME = _xdg("XDG_CACHE_HOME", ".cache")
+CONFIG_DIR = CONFIG_HOME / "drime-desktop"   # window.json, updates.json, daemon.json
+CACHE_DIR = CACHE_HOME / "drime-desktop"     # web cache, daemon.log
+
 REMOTE = "drime"
 MOUNT = HOME / "Drime"
 SYNC_DIR = HOME / "DrimeSync"
@@ -30,12 +53,13 @@ UNITS = (MOUNT_UNIT, SYNC_SERVICE, SYNC_TIMER)
 MIN_RCLONE = (1, 73, 0)
 WEB_URL = "https://app.drime.cloud"
 ICON_SYSTEM = Path("/usr/share/icons/hicolor/512x512/apps/drime-desktop.png")
-ICON_USER = HOME / ".local/share/icons/drime.png"
-LEGACY_LAUNCHER = HOME / ".local/share/applications/drime.desktop"
-BOOKMARKS = HOME / ".config/gtk-3.0/bookmarks"
-RCLONE_CACHE = HOME / ".cache/rclone"
-WEB_DATA_DIR = HOME / ".local/share/drime-desktop/web"   # WebKit cookies/local storage (login)
-WEB_CACHE_DIR = HOME / ".cache/drime-desktop/web"
+ICON_APP = Path("/app/share/icons/hicolor/512x512/apps/drime-desktop.png")   # Flatpak
+ICON_USER = DATA_HOME / "icons/drime.png"    # host-visible in a Flatpak (~/.var/app/<id>/data)
+LEGACY_LAUNCHER = DATA_HOME / "applications/drime.desktop"
+BOOKMARKS = HOME / ".config/gtk-3.0/bookmarks"   # always the host's file (xdg-config/gtk-3.0)
+RCLONE_CACHE = CACHE_HOME / "rclone"
+WEB_DATA_DIR = DATA_HOME / "drime-desktop/web"   # WebKit cookies/local storage (login)
+WEB_CACHE_DIR = CACHE_DIR / "web"
 
 # Set by install.sh/uninstall.sh when running from a git checkout (no package).
 SRC_DIR = Path(os.environ["DRIME_DESKTOP_SRC"]) if os.environ.get("DRIME_DESKTOP_SRC") else None
@@ -110,15 +134,24 @@ def rclone_version() -> tuple[int, ...] | None:
 
 
 OS_RELEASE = Path("/etc/os-release")
+HOST_OS_RELEASE = Path("/run/host/os-release")   # the host's file, bind-mounted by flatpak
+FLATPAK_INFO = Path("/.flatpak-info")
 RCLONE_ORG_HINT = ("install rclone 1.73 or newer from rclone.org, e.g.  curl https://rclone.org/install.sh | sudo bash  "
                    "- the rclone package of Debian and Ubuntu is too old")
 
 
+def is_flatpak() -> bool:
+    """Running inside the Flatpak sandbox (no systemd, no in-sandbox FUSE, bundled rclone)."""
+    return FLATPAK_INFO.is_file()
+
+
 def distro() -> str:
-    """'fedora', 'debian' (Debian, Ubuntu and derivatives) or 'unknown', from /etc/os-release."""
+    """'fedora', 'debian' (Debian, Ubuntu and derivatives) or 'unknown', from /etc/os-release
+    (the host's copy inside a Flatpak, where /etc/os-release describes the runtime)."""
     ids: set[str] = set()
     try:
-        for line in OS_RELEASE.read_text().splitlines():
+        source = HOST_OS_RELEASE if HOST_OS_RELEASE.is_file() else OS_RELEASE
+        for line in source.read_text().splitlines():
             key, _, value = line.partition("=")
             if key in ("ID", "ID_LIKE"):
                 ids.update(value.strip().strip('"').split())
@@ -134,7 +167,7 @@ def distro() -> str:
 def install_hint(package: str, upgrade: bool = False) -> str:
     """How to get `package` on this distribution, for error messages."""
     d = distro()
-    if d == "debian" and package == "rclone":
+    if d == "debian" and package == "rclone" and not is_flatpak():
         return RCLONE_ORG_HINT   # Debian and Ubuntu ship rclone 1.60, older than MIN_RCLONE
     if d == "fedora":
         return f"sudo dnf {'upgrade' if upgrade else 'install'} {package}"
@@ -145,14 +178,40 @@ def install_hint(package: str, upgrade: bool = False) -> str:
 
 def remove_hint() -> str:
     """The command that uninstalls this application."""
+    if is_flatpak():
+        return f"flatpak uninstall {APP_ID}"
     return {"fedora": "sudo dnf remove drime-desktop",
             "debian": "sudo apt remove drime-desktop"}.get(distro(), "uninstall the drime-desktop package")
+
+
+@functools.lru_cache(maxsize=None)
+def host_has_fusermount3() -> bool:
+    """Flatpak: the drive mounts through the host's fusermount3 (/app/bin/fusermount3 is a
+    wrapper around `flatpak-spawn --host`). False when fuse3 is missing on the host or the
+    org.freedesktop.Flatpak permission was taken away."""
+    try:
+        return run(["flatpak-spawn", "--host", "sh", "-c", "command -v fusermount3"]).returncode == 0
+    except OSError:
+        return False
+
+
+def drive_problem() -> str | None:
+    """Why the virtual drive cannot be enabled in this installation (None = it can).
+    Only the Flatpak has a drive-specific limitation; elsewhere preflight() covers fuse3."""
+    if is_flatpak() and not host_has_fusermount3():
+        return f"The virtual drive needs fuse3 on your system ({install_hint('fuse3')})."
+    return None
 
 
 def preflight() -> list[str]:
     """Return a list of human-readable blocking problems (empty = all good)."""
     problems = []
     ver = rclone_version()
+    if is_flatpak():
+        # rclone is bundled; fuse3 is only needed for the drive (drive_problem()); no systemd.
+        if ver is None:
+            problems.append("rclone is missing from this Flatpak build (packaging bug).")
+        return problems
     if ver is None:
         problems.append(f"rclone is not installed ({install_hint('rclone')}).")
     elif ver < MIN_RCLONE:
@@ -191,18 +250,88 @@ def delete_remote() -> None:
     run(["rclone", "config", "delete", REMOTE])
 
 
+# --- Background service (Flatpak) ---------------------------------------------
+# The systemd units cannot exist in the sandbox. `drime-desktop --daemon` (daemon.py)
+# takes their place: it holds the mount and runs the sync on a timer, reads what is
+# enabled from daemon.json and reports through status.json (sandbox.py). It is
+# autostarted at login through the Background portal and (re)spawned by the GUI.
+
+_last_watchdog = 0.0
+
+
+def _settle_daemon(log: LogCb = _noop) -> None:
+    """After an enable/disable: make sure the service and its login autostart match
+    what is enabled. A denied background permission is reported, not fatal."""
+    from . import portal, sandbox
+    cfg = sandbox.read_config()
+    if cfg["mount"] or cfg["sync"]:
+        if not portal.request_background(True):
+            log("Note: the desktop did not allow Drime to run in the background; the drive and "
+                "the sync only run while the Drime window is open.")
+        if not sandbox.ensure_daemon():
+            raise RuntimeError("Could not start the Drime background service.")
+    else:
+        sandbox.stop_daemon()
+        portal.request_background(False)
+
+
+def watchdog() -> None:
+    """Flatpak: respawn the background service if it died while something is enabled.
+    Called from the GUI's refresh tick; rate-limited to once a minute."""
+    global _last_watchdog
+    if not is_flatpak() or time.monotonic() - _last_watchdog < 60:
+        return
+    from . import sandbox
+    cfg = sandbox.read_config()
+    if (cfg["mount"] or cfg["sync"]) and not sandbox.daemon_alive():
+        _last_watchdog = time.monotonic()
+        sandbox.ensure_daemon()
+
+
+def daemon_alive() -> bool | None:
+    """Whether the background service runs (None outside a Flatpak)."""
+    if not is_flatpak():
+        return None
+    from . import sandbox
+    return sandbox.daemon_alive()
+
+
+def _wait_for(cond: Callable[[], bool], timeout: float, step: float = 0.5) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        if cond():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(step)
+
+
 # --- systemd units -----------------------------------------------------------
 
 def is_enabled(unit: str) -> bool:
+    if is_flatpak():
+        from . import sandbox
+        cfg = sandbox.read_config()
+        return {MOUNT_UNIT: cfg["mount"], SYNC_TIMER: cfg["sync"]}.get(unit, False)
     return systemctl("is-enabled", unit).returncode == 0
 
 
 def is_active(unit: str) -> bool:
+    if is_flatpak():
+        from . import sandbox
+        st = sandbox.read_status()
+        if unit == MOUNT_UNIT:
+            return sandbox.daemon_alive() and bool(st.get("mount", {}).get("running"))
+        if unit == SYNC_SERVICE:
+            return sandbox.daemon_alive() and bool(st.get("sync", {}).get("running"))
+        return False
     return systemctl("is-active", unit).returncode == 0
 
 
 def unit_source(unit: str) -> str:
     """'packaged' (/usr/lib/systemd/user), 'user' (~/.config/systemd/user) or 'none'."""
+    if is_flatpak():
+        return "none"
     frag = systemctl("show", "-p", "FragmentPath", "--value", unit).stdout.strip()
     if not frag:
         return "none"
@@ -212,10 +341,12 @@ def unit_source(unit: str) -> str:
 
 
 def packaged_units_available() -> bool:
-    return all((SYSTEM_UNIT_DIR / u).is_file() for u in UNITS)
+    return not is_flatpak() and all((SYSTEM_UNIT_DIR / u).is_file() for u in UNITS)
 
 
 def user_unit_copies() -> list[str]:
+    if is_flatpak():
+        return []
     return [u for u in UNITS if (USER_UNIT_DIR / u).exists()]
 
 
@@ -226,7 +357,7 @@ def migrate_user_units(log: LogCb = _noop) -> bool:
     swapped. Returns True when something was migrated.
     """
     copies = user_unit_copies()
-    if not copies or not packaged_units_available():
+    if is_flatpak() or not copies or not packaged_units_available():
         return False
     log("Migrating systemd units to the packaged versions")
     enabled = [u for u in (MOUNT_UNIT, SYNC_TIMER) if is_enabled(u)]
@@ -242,6 +373,8 @@ def migrate_user_units(log: LogCb = _noop) -> bool:
 
 def ensure_units(log: LogCb = _noop) -> None:
     """Make sure the three units are known to systemd (packaged or user copies)."""
+    if is_flatpak():
+        return
     if packaged_units_available():
         migrate_user_units(log)
     else:
@@ -277,17 +410,55 @@ def is_stale_mount() -> bool:
         return True
 
 
+def _host_mounted() -> bool:
+    """Flatpak: ask the host whether ~/Drime is an rclone mount. The mount is created in
+    the host's mount namespace and should propagate into the sandbox (bubblewrap makes
+    / a slave mount), but this is the fallback in case it does not show in /proc/mounts."""
+    try:
+        return run(["flatpak-spawn", "--host", "findmnt", "-n", "-T", str(MOUNT),
+                    "-t", "fuse.rclone"]).returncode == 0
+    except OSError:
+        return False
+
+
 def is_mounted() -> bool:
     """Mounted *and* answering (a stale mountpoint left by a crashed rclone doesn't count)."""
+    if is_flatpak():
+        return (_in_proc_mounts() or _host_mounted()) and not is_stale_mount()
     return _in_proc_mounts() and not is_stale_mount()
 
 
 def unmount(lazy: bool = True) -> None:
-    if _in_proc_mounts():
+    if is_flatpak() or _in_proc_mounts():
+        # In a Flatpak /app/bin/fusermount3 forwards to the host's; run it unconditionally
+        # because the sandbox's /proc/mounts may not show the host-side mount.
         run(["fusermount3", "-uz" if lazy else "-u", str(MOUNT)])
 
 
+def _mount_enable_flatpak(log: LogCb) -> None:
+    from . import sandbox
+    problem = drive_problem()
+    if problem:
+        raise RuntimeError(problem)
+    sandbox.write_config(mount=True)
+    _settle_daemon(log)
+    if not _wait_for(is_mounted, 30):
+        raise RuntimeError("The drive did not come up. Last log lines:\n" + sandbox.log_tail(10))
+    log(f"Virtual drive mounted at {MOUNT} (held by the Drime background service)")
+
+
+def _mount_disable_flatpak(log: LogCb) -> None:
+    from . import sandbox
+    sandbox.write_config(mount=False)
+    _wait_for(lambda: not sandbox.read_status().get("mount", {}).get("running"), 10)
+    unmount()
+    _settle_daemon(log)
+    log("Virtual drive disabled")
+
+
 def mount_enable(log: LogCb = _noop) -> None:
+    if is_flatpak():
+        return _mount_enable_flatpak(log)
     ensure_units(log)
     if is_stale_mount():
         unmount()
@@ -299,6 +470,8 @@ def mount_enable(log: LogCb = _noop) -> None:
 
 
 def mount_disable(log: LogCb = _noop) -> None:
+    if is_flatpak():
+        return _mount_disable_flatpak(log)
     systemctl("disable", "--now", MOUNT_UNIT)
     unmount()
     log("Virtual drive disabled")
@@ -321,6 +494,17 @@ def bookmark_remove() -> None:
 
 
 def icon_path() -> Path | None:
+    if is_flatpak():
+        # /app is invisible to the host's file manager: keep a copy in the app's data dir
+        # (~/.var/app/<id>/data on the host) for the folder icon.
+        try:
+            if ICON_APP.is_file() and (not ICON_USER.is_file()
+                                       or ICON_USER.stat().st_mtime < ICON_APP.stat().st_mtime):
+                ICON_USER.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(ICON_APP, ICON_USER)
+        except OSError:
+            pass
+        return ICON_USER if ICON_USER.is_file() else None
     if ICON_SYSTEM.is_file():
         return ICON_SYSTEM
     if SRC_DIR is not None and (SRC_DIR / "assets/drime.png").is_file():
@@ -362,6 +546,13 @@ def bisync_baseline(log: LogCb = _noop) -> None:
 
 
 def sync_enable(log: LogCb = _noop) -> None:
+    if is_flatpak():
+        from . import sandbox
+        bisync_baseline(log)
+        sandbox.write_config(sync=True)
+        _settle_daemon(log)
+        log("Sync scheduled every 15 minutes (Drime background service)")
+        return
     ensure_units(log)
     bisync_baseline(log)
     cp = systemctl("enable", "--now", SYNC_TIMER)
@@ -371,11 +562,22 @@ def sync_enable(log: LogCb = _noop) -> None:
 
 
 def sync_disable(log: LogCb = _noop) -> None:
+    if is_flatpak():
+        from . import sandbox
+        sandbox.write_config(sync=False)
+        _settle_daemon(log)
+        log("Sync disabled")
+        return
     systemctl("disable", "--now", SYNC_TIMER)
     log("Sync timer disabled")
 
 
 def sync_now() -> None:
+    if is_flatpak():
+        from . import sandbox
+        sandbox.trigger("sync-now")
+        sandbox.ensure_daemon()   # the service runs the pending sync even when the timer is off
+        return
     systemctl("start", "--no-block", SYNC_SERVICE)
 
 
@@ -396,6 +598,17 @@ def _unix(value: str) -> int | None:
 
 
 def sync_status() -> SyncStatus:
+    if is_flatpak():
+        from . import sandbox
+        s = sandbox.read_status().get("sync", {})
+        alive = sandbox.daemon_alive()
+        return SyncStatus(
+            running=alive and bool(s.get("running")),
+            last_result=s.get("last_result") or "",
+            last_start=s.get("last_start"),
+            last_end=s.get("last_end"),
+            next_run=s.get("next_run") if alive else None,
+        )
     out = systemctl("show", SYNC_SERVICE, "--timestamp=unix", "-p",
                     "ActiveState,Result,ExecMainStartTimestamp,ExecMainExitTimestamp").stdout
     props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
@@ -417,6 +630,9 @@ def sync_status() -> SyncStatus:
 
 
 def sync_log_tail(lines: int = 60) -> str:
+    if is_flatpak():
+        from . import sandbox
+        return sandbox.log_tail(lines)
     return run(["journalctl", "--user", "-u", SYNC_SERVICE, "-n", str(lines),
                 "--no-pager", "-o", "short-iso"]).stdout
 
@@ -434,6 +650,8 @@ class State:
     sync_initialized: bool
     user_unit_copies: list[str]
     packaged_units: bool
+    drive_problem: str | None = None    # Flatpak: why the drive cannot be enabled
+    daemon_alive: bool | None = None    # Flatpak: the background service runs (None elsewhere)
 
     @property
     def configured(self) -> bool:
@@ -454,13 +672,15 @@ def state() -> State:
         sync_initialized=bisync_initialized(),
         user_unit_copies=user_unit_copies(),
         packaged_units=packaged_units_available(),
+        drive_problem=drive_problem(),
+        daemon_alive=daemon_alive(),
     )
 
 
 def cleanup_legacy() -> bool:
     """Remove the per-user launcher/icon written by the old install.sh
     (they duplicate the packaged ones). Returns True if anything was removed."""
-    if not ICON_SYSTEM.is_file():
+    if is_flatpak() or not ICON_SYSTEM.is_file():
         return False
     removed = False
     if LEGACY_LAUNCHER.exists():
@@ -489,30 +709,49 @@ def install_all(token: str | None, log: LogCb = _noop, with_pydrime: bool = Fals
         raise RuntimeError("Cannot reach Drime with the configured token.")
     log("Drime account reachable")
 
-    mount_enable(log)
-    bookmark_add()
-    if folder_icon_set():
-        log("Drime icon applied to the folder")
+    problem = drive_problem()
+    if problem:
+        log(f"Virtual drive skipped: {problem}")
+    else:
+        mount_enable(log)
+        bookmark_add()
+        if folder_icon_set():
+            log("Drime icon applied to the folder")
     cleanup_legacy()
 
     sync_enable(log)
 
     if with_pydrime:
-        run_logged(["python3", "-m", "pip", "install", "--user", "--quiet", "pydrime"], log)
-        log("pydrime installed - run 'pydrime init' and paste the same API token")
+        if is_flatpak():
+            log("pydrime cannot be installed from inside the Flatpak; run "
+                "'python3 -m pip install --user pydrime' on your system instead")
+        else:
+            run_logged(["python3", "-m", "pip", "install", "--user", "--quiet", "pydrime"], log)
+            log("pydrime installed - run 'pydrime init' and paste the same API token")
 
 
 def uninstall_all(purge_config: bool = False, log: LogCb = _noop) -> None:
     folder_icon_unset()
-    systemctl("disable", "--now", SYNC_TIMER)
-    systemctl("stop", SYNC_SERVICE)
-    systemctl("disable", "--now", MOUNT_UNIT)
-    unmount()
-    for u in UNITS:
-        (USER_UNIT_DIR / u).unlink(missing_ok=True)
-    systemctl("daemon-reload")
-    systemctl("reset-failed")
-    log("Drive unmounted, services disabled")
+    if is_flatpak():
+        from . import portal, sandbox
+        sandbox.write_config(mount=False, sync=False)
+        sandbox.stop_daemon()
+        unmount()
+        portal.request_background(False)   # drops the login autostart entry
+        sandbox.CONFIG_FILE.unlink(missing_ok=True)
+        for f in (sandbox.LOG_FILE, sandbox.LOG_FILE.with_suffix(".log.1")):
+            f.unlink(missing_ok=True)
+        log("Drive unmounted, background service stopped")
+    else:
+        systemctl("disable", "--now", SYNC_TIMER)
+        systemctl("stop", SYNC_SERVICE)
+        systemctl("disable", "--now", MOUNT_UNIT)
+        unmount()
+        for u in UNITS:
+            (USER_UNIT_DIR / u).unlink(missing_ok=True)
+        systemctl("daemon-reload")
+        systemctl("reset-failed")
+        log("Drive unmounted, services disabled")
 
     if LEGACY_LAUNCHER.exists():
         LEGACY_LAUNCHER.unlink()
@@ -535,7 +774,10 @@ def uninstall_all(purge_config: bool = False, log: LogCb = _noop) -> None:
 
     if purge_config:
         delete_remote()
-        shutil.rmtree(HOME / ".config/pydrime", ignore_errors=True)
-        run(["python3", "-m", "pip", "uninstall", "-y", "-q", "pydrime"])
-        log("API token (rclone remote) and pydrime configuration removed")
+        if is_flatpak():
+            log("API token (rclone remote) removed")
+        else:
+            shutil.rmtree(HOME / ".config/pydrime", ignore_errors=True)
+            run(["python3", "-m", "pip", "uninstall", "-y", "-q", "pydrime"])
+            log("API token (rclone remote) and pydrime configuration removed")
     log(f"Kept: {SYNC_DIR} and everything in your cloud account")

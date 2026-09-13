@@ -8,6 +8,7 @@ rclone.conf
 .DS_Store
 build/
 __pycache__/
+.flatpak-builder/
 
 # Debian build leftovers (debian/changelog is generated from the spec by `make deb`)
 debian/changelog

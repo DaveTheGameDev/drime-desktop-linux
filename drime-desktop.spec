@@ -2,7 +2,7 @@
 %{!?python3_sitelib: %global python3_sitelib %(python3 -c "import sysconfig as s; print(s.get_path('purelib', 'rpm_prefix' if 'rpm_prefix' in s.get_scheme_names() else None))")}
 
 Name:           drime-desktop
-Version:        0.4.1
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        Unofficial Drime cloud desktop app (virtual drive, sync folder, web app)
 License:        MIT
@@ -67,6 +67,22 @@ appstream-util validate-relax --nonet %{buildroot}%{_metainfodir}/*.xml
 %{_metainfodir}/io.github.davethegamedev.DrimeDesktop.metainfo.xml
 
 %changelog
+* Sun Sep 13 2026 DaveTheGameDev - 0.5.0-1
+- New Flatpak bundle (drime-desktop-<version>.flatpak) for every other
+  distribution, next to the RPM and the DEB. It bundles rclone 1.75.1 and runs
+  on the GNOME 50 runtime; install it with your software center or
+  flatpak install --user
+- In the Flatpak the drive and the sync folder are run by Drime's own
+  background service (drime-desktop --daemon) instead of systemd user units,
+  started at login through the desktop's background permission and restarted
+  by the app if it dies. The virtual drive mounts through the host's
+  fusermount3, so it needs fuse3 installed on the system; without it the
+  wizard and Settings offer the sync folder and the web app only
+- Flatpak updates: the app downloads the new bundle and opens it in your
+  software center (no PackageKit inside the sandbox)
+- Configuration, cache and web data locations follow the XDG base directory
+  variables (unchanged on the RPM and DEB; ~/.var/app/<id>/ in the Flatpak)
+
 * Sun Aug 30 2026 DaveTheGameDev - 0.4.1-1
 - The window no longer freezes for a quarter of an hour after the computer
   wakes from sleep. WebKit funnels every request through one connection to

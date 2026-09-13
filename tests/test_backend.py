@@ -115,3 +115,116 @@ def test_child_pids_skips_unreadable_entries(tmp_path):
     (tmp_path / "300").mkdir()
     (tmp_path / "300" / "stat").write_text("garbage")
     assert backend.child_pids("WebKitNetworkProcess", proc, parent=7) == [100]
+
+
+# --- Flatpak -------------------------------------------------------------------
+
+def test_is_flatpak(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, "FLATPAK_INFO", tmp_path / "missing")
+    assert not backend.is_flatpak()
+    info = tmp_path / ".flatpak-info"
+    info.write_text("[Application]\n")
+    monkeypatch.setattr(backend, "FLATPAK_INFO", info)
+    assert backend.is_flatpak()
+
+
+def test_distro_prefers_the_host_os_release(monkeypatch, tmp_path):
+    """Inside the sandbox /etc/os-release describes the runtime; the host's copy wins."""
+    runtime = tmp_path / "os-release"
+    runtime.write_text('ID=org.gnome.platform\n')
+    host = tmp_path / "host-os-release"
+    host.write_text('ID=ubuntu\nID_LIKE=debian\n')
+    monkeypatch.setattr(backend, "OS_RELEASE", runtime)
+    monkeypatch.setattr(backend, "HOST_OS_RELEASE", host)
+    assert backend.distro() == "debian"
+    monkeypatch.setattr(backend, "HOST_OS_RELEASE", tmp_path / "none")
+    assert backend.distro() == "unknown"
+
+
+def test_hints_flatpak(fake_flatpak, fake_distro):
+    fake_distro("debian")
+    assert backend.remove_hint() == "flatpak uninstall io.github.davethegamedev.DrimeDesktop"
+    assert backend.install_hint("fuse3") == "sudo apt install fuse3"   # the host's package manager
+
+
+def test_preflight_flatpak_skips_fuse_and_systemd(fake_flatpak, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(backend, "systemctl", lambda *a, **k: (_ for _ in ()).throw(AssertionError("systemctl")))
+    monkeypatch.setattr(backend, "rclone_version", lambda: (1, 75, 1))
+    assert backend.preflight() == []
+    monkeypatch.setattr(backend, "rclone_version", lambda: None)
+    assert backend.preflight() == ["rclone is missing from this Flatpak build (packaging bug)."]
+
+
+def test_drive_problem_needs_host_fuse(fake_flatpak, fake_distro):
+    fake_distro("fedora")
+    assert backend.drive_problem() is None
+    fake_flatpak(host_fuse=False)
+    assert backend.drive_problem() == "The virtual drive needs fuse3 on your system (sudo dnf install fuse3)."
+
+
+def test_drive_problem_outside_flatpak(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, "FLATPAK_INFO", tmp_path / "missing")
+    assert backend.drive_problem() is None
+
+
+def test_mount_enable_flatpak_refuses_without_host_fuse(fake_flatpak):
+    fake_flatpak(host_fuse=False)
+    with pytest.raises(RuntimeError, match="fuse3"):
+        backend.mount_enable()
+
+
+def test_units_are_absent_in_flatpak(fake_flatpak):
+    assert backend.unit_source(backend.MOUNT_UNIT) == "none"
+    assert not backend.packaged_units_available()
+    assert backend.user_unit_copies() == []
+    assert not backend.migrate_user_units()
+    backend.ensure_units()   # no-op, must not raise
+    assert not backend.cleanup_legacy()
+
+
+def test_state_flatpak_reads_config_and_status(fake_flatpak, monkeypatch):
+    from drime_desktop import sandbox
+    monkeypatch.setattr(backend, "rclone_version", lambda: (1, 75, 1))
+    monkeypatch.setattr(backend, "remote_exists", lambda: True)
+    monkeypatch.setattr(backend, "is_mounted", lambda: False)
+    monkeypatch.setattr(backend, "bisync_initialized", lambda: True)
+    sandbox.write_config(mount=True, sync=True)
+    st = backend.state()
+    assert st.mount_enabled and st.sync_enabled
+    assert st.daemon_alive is False and not st.mount_active
+    assert st.drive_problem is None and st.user_unit_copies == [] and not st.packaged_units
+    # With the service holding the lock and reporting a running mount:
+    sandbox.write_status({"mount": {"running": True}, "sync": {"running": False, "last_result": "success",
+                                                              "last_start": 1, "last_end": 2, "next_run": 3}})
+    with sandbox.DaemonLock() as lock:
+        assert lock.acquire()
+        assert backend.is_active(backend.MOUNT_UNIT)
+        ss = backend.sync_status()
+        assert (ss.running, ss.last_result, ss.last_end, ss.next_run) == (False, "success", 2, 3)
+    assert backend.sync_status().next_run is None   # service gone: nothing is scheduled
+
+
+def test_icon_path_flatpak_copies_to_a_host_visible_place(fake_flatpak):
+    assert backend.icon_path() is None
+    backend.ICON_APP.write_bytes(b"png")
+    assert backend.icon_path() == backend.ICON_USER
+    assert backend.ICON_USER.read_bytes() == b"png"
+
+
+def test_xdg_paths_follow_the_environment(monkeypatch, tmp_path):
+    import importlib
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "c"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "d"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "k"))
+    try:
+        importlib.reload(backend)
+        assert backend.CONFIG_DIR == tmp_path / "c/drime-desktop"
+        assert backend.WEB_DATA_DIR == tmp_path / "d/drime-desktop/web"
+        assert backend.RCLONE_CACHE == tmp_path / "k/rclone"
+        assert backend.WEB_CACHE_DIR == tmp_path / "k/drime-desktop/web"
+        assert backend.BOOKMARKS == backend.HOME / ".config/gtk-3.0/bookmarks"   # always the host file
+    finally:
+        monkeypatch.delenv("XDG_CONFIG_HOME"); monkeypatch.delenv("XDG_DATA_HOME"); monkeypatch.delenv("XDG_CACHE_HOME")
+        importlib.reload(backend)
+    assert backend.CONFIG_DIR == backend.HOME / ".config/drime-desktop"

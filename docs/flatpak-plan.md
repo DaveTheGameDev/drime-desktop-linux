@@ -1,6 +1,10 @@
 # Flatpak / Flathub plan for Drime Desktop
 
-Status: research done 2026-09-13, nothing implemented yet.
+Status: research done 2026-09-13. Implemented in 0.5.0 as a self-hosted bundle on the
+GitHub Releases (`flatpak/`, `src/drime_desktop/{daemon,sandbox,portal}.py`): Tier 1 from the
+start, since a bundle is not subject to the Flathub linter; rclone is the official prebuilt
+binary rather than a vendored Go build. Flathub submission (steps 1, 3, 5, 7, 8 below) is
+still open.
 
 ## Verdict
 

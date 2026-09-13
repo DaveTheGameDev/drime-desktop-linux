@@ -14,6 +14,8 @@ from .app import LogView, button, run_async  # noqa: E402
 
 TOKEN_HELP = ("Create a token at app.drime.cloud → Settings → Developer, then paste it here. "
               "It is stored only in your rclone configuration.")
+SERVICE_NOTE = ("\n\nIn this Flatpak it is run by Drime's own background service, which starts at login "
+                "— your desktop may ask whether Drime is allowed to run in the background.")
 
 
 def needs_wizard() -> bool:
@@ -102,8 +104,9 @@ class WizardWindow(Adw.ApplicationWindow):
 
     def welcome_page(self):
         p = Step(self, "Welcome to Drime",
-                 "This sets up your Drime cloud on this computer: a virtual drive in your home folder, "
-                 "a two-way synced folder, and the Drime web app right here in this window.",
+                 "This sets up your Drime cloud on this computer: a virtual drive in your home folder"
+                 + (" (needs fuse3 on your system)" if backend.is_flatpak() else "")
+                 + ", a two-way synced folder, and the Drime web app right here in this window.",
                  "drime-desktop")
         icon = backend.icon_path()
         if icon is not None:  # works before the packaged icon is in the theme cache / from a git checkout
@@ -145,10 +148,20 @@ class WizardWindow(Adw.ApplicationWindow):
         return p
 
     def drive_page(self):
+        problem = self.state.drive_problem
+        if problem:
+            p = Step(self, "Virtual drive",
+                     f"The virtual drive is not available in this installation: {problem} "
+                     "You can turn it on later in Settings once fuse3 is installed.",
+                     "drive-harddisk-symbolic")
+            p.buttons.append(button("Continue", self.go_sync, "suggested-action", "pill"))
+            p.finish_layout()
+            return p
         p = Step(self, "Virtual drive",
                  f"Your whole Drime account will appear at {backend.MOUNT}, mounted automatically "
                  "at login. Files download on demand and are cached locally (up to 10 GB); "
-                 "anything you save there uploads automatically.",
+                 "anything you save there uploads automatically."
+                 + (SERVICE_NOTE if backend.is_flatpak() else ""),
                  "drive-harddisk-symbolic")
         def enable():
             def work():
@@ -169,7 +182,8 @@ class WizardWindow(Adw.ApplicationWindow):
                  f"{backend.SYNC_DIR} will mirror the “Sync” folder of your cloud in both directions "
                  "every 15 minutes, so you always have an offline copy. A small RCLONE_TEST marker file "
                  "is placed on both sides as a safety check — please don't delete it.\n\n"
-                 "The first run compares both sides and can take a while if the folder is large.",
+                 "The first run compares both sides and can take a while if the folder is large."
+                 + (SERVICE_NOTE if backend.is_flatpak() else ""),
                  "folder-remote-symbolic")
         def enable():
             p.log.set_visible(True)

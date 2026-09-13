@@ -82,9 +82,45 @@ jobs:
           name: debs
           path: build/deb/*
 
+  flatpak:
+    # Single-file bundle for any distribution; the runtime comes from Flathub at install time.
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Trust workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Version
+        id: v
+        run: echo "version=$(sed -n 's/^Version:[[:space:]]*//p' drime-desktop.spec | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Check tag matches spec version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          v="${{ steps.v.outputs.version }}"
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "Tag $GITHUB_REF_NAME != spec version v$v"; exit 1; }
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: flatpak/io.github.davethegamedev.DrimeDesktop.yml
+          bundle: drime-desktop-${{ steps.v.outputs.version }}.flatpak
+          cache-key: flatpak-builder-${{ github.sha }}
+          upload-artifact: false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak
+          path: drime-desktop-*.flatpak
+
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [rpm, deb]
+    needs: [rpm, deb, flatpak]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -101,6 +137,11 @@ jobs:
           name: debs
           path: build/deb
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: flatpak
+          path: build/flatpak
+
       # The rpms artifact keeps the RPMS/SRPMS/SOURCES layout of the build tree.
       - name: Release notes
         run: scripts/release-notes.sh "$(make -s version)" "$(basename build/rpms/RPMS/noarch/*.noarch.rpm)" > build/release-notes.md
@@ -112,5 +153,6 @@ jobs:
           files: |
             build/rpms/RPMS/noarch/*.noarch.rpm
             build/deb/*.deb
+            build/flatpak/*.flatpak
             build/rpms/SRPMS/*.src.rpm
             build/rpms/SOURCES/*.tar.gz
