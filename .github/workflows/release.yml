@@ -147,7 +147,7 @@ jobs:
         run: scripts/release-notes.sh "$(make -s version)" "$(basename build/rpms/RPMS/noarch/*.noarch.rpm)" > build/release-notes.md
 
       - name: Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           body_path: build/release-notes.md
           files: |
