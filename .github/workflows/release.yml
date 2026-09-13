@@ -37,7 +37,7 @@ jobs:
       - name: Build
         run: make rpm lint
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rpms
           path: |
@@ -77,7 +77,7 @@ jobs:
           drime-desktop --version
           dpkg -L drime-desktop
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: debs
           path: build/deb/*
@@ -113,7 +113,7 @@ jobs:
           cache-key: flatpak-builder-${{ github.sha }}
           upload-artifact: false
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: flatpak
           path: drime-desktop-*.flatpak
